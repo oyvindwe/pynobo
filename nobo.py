@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 
-# Python Websocet Control of Nobø Hub - Nobø Energy Control
+# Python TCP/IP Control of Nobø Hub - Nobø Energy Control
 # This system/service/software is not officially supported or endorsed by Glen Dimplex Nordic AS, and I am not an official partner of Glen Dimplex Nordic AS
 # API: https://www.glendimplex.no/media/15650/nobo-hub-api-v-1-1-integration-for-advanced-users.pdf
 
@@ -132,6 +132,7 @@ class nobo:
         STRUCT_KEYS_COMPONENT = ['serial', 'status', 'name', 'reverse_onoff', 'zone_id', 'override_id', 'tempsensor_for_zone_id']
         STRUCT_KEYS_WEEK_PROFILE = ['week_profile_id', 'name', 'profile'] # profile is minimum 7 and probably more values separated by comma
         STRUCT_KEYS_OVERRIDE = ['override_id', 'mode', 'type', 'end_time', 'start_time', 'target_type', 'target_id']
+        STRUCT_KEYS_TEMPERATURE = ['serial', 'temperature']
 
         NAME_OFF = 'off'
         NAME_AWAY = 'away'
@@ -144,7 +145,7 @@ class nobo:
         DICT_NAME_TO_OVERRIDE_MODE = {NAME_NORMAL : OVERRIDE_MODE_NORMAL, NAME_COMFORT : OVERRIDE_MODE_COMFORT, NAME_ECO : OVERRIDE_MODE_ECO, NAME_AWAY : OVERRIDE_MODE_AWAY}
         DICT_NAME_TO_WEEK_PROFILE_STATUS = {NAME_ECO : WEEK_PROFILE_STATE_ECO, NAME_COMFORT : WEEK_PROFILE_STATE_COMFORT, NAME_AWAY : WEEK_PROFILE_STATE_AWAY, NAME_OFF : WEEK_PROFILE_STATE_OFF}
 
-    def __init__(self, serial, ip=None, discover=True):
+    def __init__(self, serial, ip=None, discover=True, callback=lambda *args, **kwargs: None):
         self.logger = logging.getLogger(__name__)
         self.hub_info = {}
         self.zones = collections.OrderedDict()
@@ -152,6 +153,7 @@ class nobo:
         self.week_profiles = collections.OrderedDict()
         self.overrides = collections.OrderedDict()
         self.temperatures = collections.OrderedDict()
+        self.callback = callback
 
         # Get a socket connection, either by scanning or directly
         if discover:
@@ -396,7 +398,7 @@ class nobo:
                     self.reconnect_hub()
             except Exception as e:
                 # Ops, now we have real problems
-                self.logger.error("Unhandeled exception: %s", e, exc_info=1)
+                self.logger.error("Unhandled exception: %s", e, exc_info=1)
                 # Just disconnect (in stead of risking an infinite reconnect loop)
                 self.socket_receive_exit_flag.set()
 
@@ -415,56 +417,74 @@ class nobo:
         # The added/updated info messages
         elif r[0] in [self.API.RESPONSE_ZONE_INFO, self.API.RESPONSE_ADD_ZONE ,self.API.RESPONSE_UPDATE_ZONE]:
             dicti = collections.OrderedDict(zip(self.API.STRUCT_KEYS_ZONE, r[1:]))
+            action = 'updated' if dicti['zone_id'] in self.zones else 'added'
             self.zones[dicti['zone_id']] = dicti
-            self.logger.info('added/updated zone: %s', dicti['name'])
+            self.logger.info('%s zone: %s', action, dicti['name'])
+            self.callback('zone', action, dicti)
 
         elif r[0] in [self.API.RESPONSE_COMPONENT_INFO, self.API.RESPONSE_ADD_COMPONENT ,self.API.RESPONSE_UPDATE_COMPONENT]:
             dicti = collections.OrderedDict(zip(self.API.STRUCT_KEYS_COMPONENT, r[1:]))
+            action = 'updated' if dicti['serial'] in self.components else 'added'
             self.components[dicti['serial']] = dicti
-            self.logger.info('added/updated component: %s', dicti['name'])
+            self.logger.info('%s component: %s', action, dicti['name'])
+            self.callback('component', action, dicti)
 
         elif r[0] in [self.API.RESPONSE_WEEK_PROFILE_INFO, self.API.RESPONSE_ADD_WEEK_PROFILE, self.API.RESPONSE_UPDATE_WEEK_PROFILE]:
             dicti = collections.OrderedDict(zip(self.API.STRUCT_KEYS_WEEK_PROFILE, r[1:]))
             dicti['profile'] = r[-1].split(',')
+            action = 'updated' if dicti['week_profile_id'] in self.week_profiles else 'added'
             self.week_profiles[dicti['week_profile_id']] = dicti
-            self.logger.info('added/updated week profile: %s', dicti['name'])
+            self.logger.info('%s week profile: %s', action, dicti['name'])
+            self.callback('week_profile', action, dicti)
 
         elif r[0] in [self.API.RESPONSE_OVERRIDE_INFO, self.API.RESPONSE_ADD_OVERRIDE]:
             dicti = collections.OrderedDict(zip(self.API.STRUCT_KEYS_OVERRIDE, r[1:]))
+            action = 'updated' if dicti['override_id'] in self.overrides else 'added'
             self.overrides[dicti['override_id']] = dicti
-            self.logger.info('added/updated override: id %s', dicti['override_id'])
+            self.logger.info('%s override: id %s', action, dicti['override_id'])
+            self.callback('override', action, dicti)
 
         elif r[0] in [self.API.RESPONSE_HUB_INFO, self.API.RESPONSE_UPDATE_HUB_INFO]:
             self.hub_info = collections.OrderedDict(zip(self.API.STRUCT_KEYS_HUB, r[1:]))
             self.logger.info('updated hub info: %s', self.hub_info)
             if r[0] == self.API.RESPONSE_HUB_INFO:
+                action = 'added'
                 self.socket_received_all_info.set()
+            else:
+                action = 'updated'
+            self.callback('hub', action, self.hub_info)
 
         # The removed info messages
         elif r[0] == self.API.RESPONSE_REMOVE_ZONE:
             dicti = collections.OrderedDict(zip(self.API.STRUCT_KEYS_ZONE, r[1:]))
             popped_zone = self.zones.pop(dicti['zone_id'], None)
             self.logger.info('removed zone: %s', dicti['name'])
+            self.callback('zone', 'removed', dicti)
 
         elif r[0] == self.API.RESPONSE_REMOVE_COMPONENT:
             dicti = collections.OrderedDict(zip(self.API.STRUCT_KEYS_COMPONENT, r[1:]))
             popped_component = self.components.pop(dicti['serial'], None)
             self.logger.info('removed component: %s', dicti['name'])
+            self.callback('component', 'removed', dicti)
 
         elif r[0] == self.API.RESPONSE_REMOVE_WEEK_PROFILE:
             dicti = collections.OrderedDict(zip(self.API.STRUCT_KEYS_WEEK_PROFILE, r[1:]))
             popped_profile = self.week_profiles.pop(dicti['week_profile_id'], None)
             self.logger.info('removed week profile: %s', dicti['name'])
+            self.callback('profile', 'removed', dicti)
 
         elif r[0] == self.API.RESPONSE_REMOVE_OVERRIDE:
             dicti = collections.OrderedDict(zip(self.API.STRUCT_KEYS_OVERRIDE, r[1:]))
             popped_override = self.overrides.pop(dicti['override_id'], None)
             self.logger.info('removed override: id%s', dicti['override_id'])
+            self.callback('override', 'removed', dicti)
 
         # Component temperature data
         elif r[0] == self.API.RESPONSE_COMPONENT_TEMP:
-            self.temperatures[r[1]] = r[2]
-            self.logger.info('updated temperature from {}: {}'.format(r[1], r[2]))
+            dicti = collections.OrderedDict(zip(self.API.STRUCT_KEYS_TEMPERATURE, r[1:]))
+            self.temperatures[dicti['serial']] = dicti['temperatur']
+            self.logger.info('updated temperature from {}: {}'.format(dicti['serial'], dicti['temperature']))
+            self.callback('component', 'temperature', dicti)
 
         # Internet settings
         elif r[0] == self.API.RESPONSE_UPDATE_INTERNET_ACCESS:
