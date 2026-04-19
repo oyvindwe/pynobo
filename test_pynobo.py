@@ -76,5 +76,57 @@ class TestPyTypedMarker(unittest.TestCase):
         self.assertTrue(marker.is_file(), f"{marker} is missing")
 
 
+class TestConnectionStateAPI(unittest.TestCase):
+
+    def _make_hub(self):
+        return nobo('123', discover=False, synchronous=False)
+
+    def test_initial_state_is_disconnected(self):
+        hub = self._make_hub()
+        events = []
+        hub.register_connection_callback(lambda h, s: events.append(s))
+        self.assertFalse(hub.connected)
+        self.assertEqual(events, [])
+
+    def test_transition_fires_callback_once(self):
+        hub = self._make_hub()
+        events = []
+        hub.register_connection_callback(lambda h, s: events.append((h is hub, s)))
+        hub._set_connected(True)
+        self.assertTrue(hub.connected)
+        self.assertEqual(events, [(True, True)])
+
+    def test_transitions_are_idempotent(self):
+        hub = self._make_hub()
+        events = []
+        hub.register_connection_callback(lambda h, s: events.append(s))
+        hub._set_connected(True)
+        hub._set_connected(True)
+        hub._set_connected(False)
+        hub._set_connected(False)
+        self.assertEqual(events, [True, False])
+
+    def test_deregister_stops_callback(self):
+        hub = self._make_hub()
+        events = []
+        cb = lambda h, s: events.append(s)
+        hub.register_connection_callback(cb)
+        hub._set_connected(True)
+        hub.deregister_connection_callback(cb)
+        hub._set_connected(False)
+        self.assertEqual(events, [True])
+
+    def test_callback_exception_does_not_break_dispatch(self):
+        hub = self._make_hub()
+        events = []
+        def boom(h, s):
+            raise RuntimeError("boom")
+        hub.register_connection_callback(boom)
+        hub.register_connection_callback(lambda h, s: events.append(s))
+        hub._set_connected(True)
+        self.assertEqual(events, [True])
+        self.assertTrue(hub.connected)
+
+
 if __name__ == '__main__':
     unittest.main()

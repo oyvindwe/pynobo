@@ -104,6 +104,23 @@ not perform any I/O, and can safely be called from the event loop.
 * get_current_zone_temperature - Get the current temperature from (the first component in) a zone
 * get_zone_override_mode - Get the override mode for the zone
 
+### Connection state
+
+Consumers can observe when the hub connects, disconnects, or reconnects. The
+`connected` property reflects the current state; register a callback to be
+notified on every transition. Callbacks MUST be safe to call from the event
+loop; exceptions they raise are logged and swallowed.
+
+    # Called with (hub, True) on connect/reconnect, (hub, False) on disconnect
+    def on_connection_state(hub, connected):
+        print("connected" if connected else "disconnected")
+
+    hub.register_connection_callback(on_connection_state)
+    await hub.connect()
+    assert hub.connected
+    # ...later, to stop listening:
+    hub.deregister_connection_callback(on_connection_state)
+
 ## Exceptions
 
 Errors raised by pynobo inherit from `PynoboError`:
