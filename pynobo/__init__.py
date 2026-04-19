@@ -399,6 +399,8 @@ class nobo:
         self.timezone = timezone
 
         self._callbacks: list[Callable[["nobo"], None]] = []
+        self._connection_callbacks: list[Callable[["nobo", bool], None]] = []
+        self._connected: bool = False
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._keep_alive_task: asyncio.Task[None] | None = None
@@ -450,6 +452,31 @@ class nobo:
         """
         self._callbacks.remove(callback)
 
+    @property
+    def connected(self) -> bool:
+        """Whether the hub is currently connected."""
+        return self._connected
+
+    def register_connection_callback(self, callback: Callable[["nobo", bool], None]) -> None:
+        """Register a callback invoked on connection-state transitions."""
+        self._connection_callbacks.append(callback)
+
+    def deregister_connection_callback(self, callback: Callable[["nobo", bool], None]) -> None:
+        """Deregister a previously registered connection-state callback."""
+        if callback in self._connection_callbacks:
+            self._connection_callbacks.remove(callback)
+
+    def _set_connected(self, value: bool) -> None:
+        """Update connection state and fire callbacks on transitions."""
+        if self._connected == value:
+            return
+        self._connected = value
+        for cb in list(self._connection_callbacks):
+            try:
+                cb(self, value)
+            except Exception:
+                _LOGGER.exception("Connection-state callback raised")
+
     async def connect(self) -> None:
         """Connect to Ecohub, either by scanning or directly."""
         connected = False
@@ -480,6 +507,8 @@ class nobo:
         if not connected:
             _LOGGER.error('Could not connect to Nobø Ecohub')
             raise PynoboConnectionError(f'Failed to connect to Nobø Ecohub with serial: {self.serial} and ip: {self.ip}')
+
+        self._set_connected(True)
 
     async def start(self) -> None:
         """Discover Ecohub and start the TCP client."""
@@ -513,6 +542,7 @@ class nobo:
                 await self._writer.wait_closed()
             self._writer = None
             _LOGGER.info('connection closed')
+        self._set_connected(False)
 
     def connect_hub(self, ip: str, serial: str) -> bool:
         warnings.warn(
@@ -645,6 +675,7 @@ class nobo:
                             raise PynoboConnectionError(f'Failed to reconnect to Nobø Ecohub at {self.ip}: {e}') from e
 
         self._keep_alive = True
+        self._set_connected(True)
         _LOGGER.info('reconnected to Nobø Hub')
 
     @staticmethod
@@ -826,10 +857,12 @@ class nobo:
                             callback(self)
                 except (asyncio.IncompleteReadError) as e:
                     _LOGGER.info('Reconnecting due to %s', e)
+                    self._set_connected(False)
                     await self.reconnect_hub()
                 except (OSError) as e:
                     if e.errno in RECONNECT_ERRORS:
                         _LOGGER.info('Reconnecting due to %s', e)
+                        self._set_connected(False)
                         await self.reconnect_hub()
                     else:
                         # Caught by the outer `except Exception` below, so don't need to wrap.
