@@ -104,11 +104,35 @@ not perform any I/O, and can safely be called from the event loop.
 * get_current_zone_temperature - Get the current temperature from (the first component in) a zone
 * get_zone_override_mode - Get the override mode for the zone
 
+## Exceptions
+
+Errors raised by pynobo inherit from `PynoboError`:
+
+* `PynoboConnectionError` — TCP connection to the hub failed or was lost
+* `PynoboHandshakeError` — the hub rejected the handshake (bad serial, wrong API version, etc.)
+* `PynoboValidationError` — invalid parameters. Also inherits `ValueError` for backwards compatibility with callers
+  written against earlier versions.
+
 ## Backwards compatibility
 
-Synchronous wrapper methods are available for compatibility with v1.1.2, but it is recommended to
-switch to the async methods by initializing the hub with `synchronous=False`. Otherwise, initializing
-will start the async event loop in a daemon thread, discover and connect to hub before returning as before.
+**Deprecated as of 1.9.0, to be removed in 2.0.** The synchronous wrapper API is still available for
+compatibility with v1.1.2, but every sync entry point now emits a `DeprecationWarning`. Migrate to
+the async API — initialize with `synchronous=False` and call the `async_*` methods from an event
+loop (or `asyncio.run(...)`).
+
+> The following APIs emit a `DeprecationWarning`:
+>
+> - `synchronous=True` in `nobo(...)` — the daemon-thread wrapper. Use the async API and
+>   `asyncio.run(hub.connect())` (or await from an existing event loop) instead.
+> - `nobo.connect_hub(ip, serial)` — use `await hub.async_connect_hub(ip, serial)`.
+> - `nobo.discover_hubs(...)` — use `await nobo.async_discover_hubs(...)`.
+> - `hub.send_command(commands)` — use `await hub.async_send_command(commands)`.
+> - `hub.create_override(...)` — use `await hub.async_create_override(...)`.
+> - `hub.update_zone(...)` — use `await hub.async_update_zone(...)`.
+> - `loop=` parameter in `nobo(...)` and `nobo.async_discover_hubs(...)`.
+
+While `synchronous=True` remains supported in 1.x, initializing this way starts the async event loop
+in a daemon thread, discovers and connects to the hub before returning as before.
 
     import time
     from pynobo import nobo

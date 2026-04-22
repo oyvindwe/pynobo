@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import collections
 from contextlib import suppress
@@ -7,7 +9,7 @@ import logging
 import threading
 import warnings
 import socket
-from typing import Union
+from typing import Any, Callable, Union
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -21,6 +23,23 @@ RECONNECT_ERRORS = [
     errno.ENETUNREACH,  # May happen if hub or local network is temporarily down
     errno.ETIMEDOUT,    # Happens if hub has not responded to handshake in 60 seconds, e.g. due to network issue
 ]
+
+
+class PynoboError(Exception):
+    """Base class for all pynobo errors."""
+
+
+class PynoboConnectionError(PynoboError):
+    """Raised when the TCP connection to the hub fails or is lost."""
+
+
+class PynoboHandshakeError(PynoboError):
+    """Raised when the hub rejects the handshake (bad serial, wrong version)."""
+
+
+class PynoboValidationError(PynoboError, ValueError, TypeError):
+    """Raised for invalid parameters. Inherits ValueError and TypeError for back-compat."""
+
 
 class nobo:
     """This is where all the Nobø Hub magic happens!"""
@@ -175,34 +194,34 @@ class nobo:
         def time_is_quarter(minutes: str):
             return int(minutes) % 15 == 0
 
-        def validate_temperature(temperature: Union[int, str]):
+        def validate_temperature(temperature: Union[int, str]) -> None:
             if type(temperature) not in (int, str):
-                raise TypeError('Temperature must be integer or string')
+                raise PynoboValidationError('Temperature must be integer or string')
             if isinstance(temperature, str) and not temperature.isdigit():
-                raise ValueError(f'Temperature "{temperature}" must be digits')
+                raise PynoboValidationError(f'Temperature "{temperature}" must be digits')
             temperature_int = int(temperature)
             if temperature_int < 7:
-                raise ValueError(f'Min temperature is 7°C')
+                raise PynoboValidationError(f'Min temperature is 7°C')
             if temperature_int > 30:
-                raise ValueError(f'Max temperature is 30°C')
+                raise PynoboValidationError(f'Max temperature is 30°C')
 
-        def validate_week_profile(profile):
+        def validate_week_profile(profile: list[str]) -> None:
             if type(profile) != list:
-                raise ValueError("Week profile must be a list")
+                raise PynoboValidationError("Week profile must be a list")
             day_count=0
             for i in profile:
                 if len(i) != 5:
-                    raise ValueError(f"Invalid week profile entry: {i}")
+                    raise PynoboValidationError(f"Invalid week profile entry: {i}")
                 time = datetime.datetime.strptime(i[0:4], "%H%M")
                 if not time.minute % 15 == 0:
-                    raise ValueError(f"Week profile entry not in whole quarters: {i}")
+                    raise PynoboValidationError(f"Week profile entry not in whole quarters: {i}")
                 # Last character is state (0=Eco, 1=Comfort, 2=Away, 4=Off)
                 if not i[4] in "0124":
-                    raise ValueError(f"Week profile entry contains invalid state, must be 0, 1, 2, or 4: {i}")
+                    raise PynoboValidationError(f"Week profile entry contains invalid state, must be 0, 1, 2, or 4: {i}")
                 if time.hour == 0 and time.minute == 0:
                     day_count+=1
             if day_count != 7:
-                raise ValueError("Week profile must contain exactly 7 entries for midnight (starting with 0000)")
+                raise PynoboValidationError("Week profile must contain exactly 7 entries for midnight (starting with 0000)")
 
 
     class Model:
@@ -306,19 +325,19 @@ class nobo:
     class DiscoveryProtocol(asyncio.DatagramProtocol):
         """Protocol to discover Nobø Echohub on local network."""
 
-        def __init__(self, serial = '', ip = None):
+        def __init__(self, serial: str = '', ip: str | None = None) -> None:
             """
             :param serial: The last 3 digits of the Ecohub serial number or the complete 12 digit serial number
             :param ip: ip address to search for Ecohub at (default None)
             """
             self.serial = serial
             self.ip = ip
-            self.hubs = set()
+            self.hubs: set[tuple[str, str]] = set()
 
-        def connection_made(self, transport: asyncio.transports.DatagramTransport):
+        def connection_made(self, transport: asyncio.transports.DatagramTransport) -> None:  # type: ignore[override]
             self.transport = transport
 
-        def datagram_received(self, data: bytes, addr):
+        def datagram_received(self, data: bytes, addr: tuple[str | Any, ...]) -> None:
             msg = data.decode('utf-8')
             _LOGGER.info('broadcast received: %s from %s', msg, addr[0])
             # Expected string “__NOBOHUB__123123123”, where 123123123 is replaced with the first 9 digits of the Hub’s serial number.
@@ -339,7 +358,22 @@ class nobo:
                 if discover_ip and discover_serial:
                     self.hubs.add( (discover_ip, discover_serial) )
 
-    def __init__(self, serial, ip=None, discover=True, loop=None, synchronous=True, timezone: datetime.tzinfo=None):
+    hub_info: dict[str, Any]
+    zones: dict[str, dict[str, Any]]
+    components: dict[str, dict[str, Any]]
+    week_profiles: dict[str, dict[str, Any]]
+    overrides: dict[str, dict[str, Any]]
+    temperatures: dict[str, str]
+
+    def __init__(
+        self,
+        serial: str,
+        ip: str | None = None,
+        discover: bool = True,
+        loop: asyncio.AbstractEventLoop | None = None,
+        synchronous: bool = True,
+        timezone: datetime.tzinfo | None = None,
+    ) -> None:
         """
         Initialize logger and dictionaries.
 
@@ -347,22 +381,28 @@ class nobo:
         :param ip: IP address to search for Ecohub at (default None)
         :param discover: True/false for using UDP autodiscovery for the IP (default True)
         :param loop: Deprecated
-        :param synchronous: True/false for using the module synchronously. For backwards compatibility.
+        :param synchronous: True/false for using the module synchronously. Deprecated, will be removed in 2.0.
+        :param timezone: Timezone used for formatting timestamps (default None = local time)
         """
 
         self.serial = serial
         self.ip = ip
         self.discover = discover
         if loop is not None:
-            _LOGGER.warning("loop is deprecated. Use synchronous=False instead.")
+            warnings.warn(
+                "the loop parameter is deprecated and will be removed in pynobo 2.0; "
+                "use synchronous=False and manage the event loop yourself.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
             synchronous=False
         self.timezone = timezone
 
-        self._callbacks = []
-        self._reader = None
-        self._writer = None
-        self._keep_alive_task = None
-        self._socket_receive_task = None
+        self._callbacks: list[Callable[["nobo"], None]] = []
+        self._reader: asyncio.StreamReader | None = None
+        self._writer: asyncio.StreamWriter | None = None
+        self._keep_alive_task: asyncio.Task[None] | None = None
+        self._socket_receive_task: asyncio.Task[None] | None = None
 
         self._received_all_info = False
         self.hub_info = {}
@@ -373,6 +413,12 @@ class nobo:
         self.temperatures = collections.OrderedDict()
 
         if synchronous:
+            warnings.warn(
+                "synchronous mode is deprecated and will be removed in pynobo 2.0; "
+                "use the async API with asyncio.run() or an existing event loop.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
             # Run asyncio in a separate thread
             try:
                 loop = asyncio.get_running_loop()
@@ -386,7 +432,7 @@ class nobo:
             thread.setDaemon(True)
             thread.start()
 
-    def register_callback(self, callback=lambda *args, **kwargs: None):
+    def register_callback(self, callback: Callable[["nobo"], None] = lambda *args, **kwargs: None) -> None:
         """
         Register a callback to notify updates to the hub state. The callback MUST be safe to call
         from the event loop. The nobo instance is passed to the callback function. Limit callbacks
@@ -396,7 +442,7 @@ class nobo:
         """
         self._callbacks.append(callback)
 
-    def deregister_callback(self, callback=lambda *args, **kwargs: None):
+    def deregister_callback(self, callback: Callable[["nobo"], None] = lambda *args, **kwargs: None) -> None:
         """
         Deregister a previously registered callback.
 
@@ -404,7 +450,7 @@ class nobo:
         """
         self._callbacks.remove(callback)
 
-    async def connect(self):
+    async def connect(self) -> None:
         """Connect to Ecohub, either by scanning or directly."""
         connected = False
         if self.discover:
@@ -412,7 +458,7 @@ class nobo:
             discovered_hubs = await self.async_discover_hubs(serial=self.serial, ip=self.ip)
             if not discovered_hubs:
                 _LOGGER.error('Failed to discover any Nobø Ecohubs')
-                raise Exception('Failed to discover any Nobø Ecohubs')
+                raise PynoboConnectionError('Failed to discover any Nobø Ecohubs')
             while discovered_hubs:
                 (discover_ip, discover_serial) = discovered_hubs.pop()
                 connected = await self.async_connect_hub(discover_ip, discover_serial)
@@ -422,20 +468,20 @@ class nobo:
             # check if we have an IP
             if not self.ip:
                 _LOGGER.error('Could not connect, no ip address provided')
-                raise ValueError('Could not connect, no ip address provided')
+                raise PynoboValidationError('Could not connect, no ip address provided')
 
             # check if we have a valid serial before we start connection
             if len(self.serial) != 12:
                 _LOGGER.error('Could not connect, no valid serial number provided')
-                raise ValueError('Could not connect, no valid serial number provided')
+                raise PynoboValidationError('Could not connect, no valid serial number provided')
 
             connected = await self.async_connect_hub(self.ip, self.serial)
 
         if not connected:
             _LOGGER.error('Could not connect to Nobø Ecohub')
-            raise Exception(f'Failed to connect to Nobø Ecohub with serial: {self.serial} and ip: {self.ip}')
+            raise PynoboConnectionError(f'Failed to connect to Nobø Ecohub with serial: {self.serial} and ip: {self.ip}')
 
-    async def start(self):
+    async def start(self) -> None:
         """Discover Ecohub and start the TCP client."""
 
         if not self._writer:
@@ -446,7 +492,7 @@ class nobo:
         self._socket_receive_task = asyncio.create_task(self.socket_receive())
         _LOGGER.info('connected to Nobø Ecohub')
 
-    async def stop(self):
+    async def stop(self) -> None:
         """Stop the keep-alive and receiver tasks and close the connection to Nobø Ecohub."""
         if self._keep_alive_task:
             self._keep_alive_task.cancel()
@@ -459,7 +505,7 @@ class nobo:
         await self.close()
         _LOGGER.info('disconnected from Nobø Ecohub')
 
-    async def close(self):
+    async def close(self) -> None:
         """Close the connection to Nobø Ecohub."""
         if self._writer:
             self._writer.close()
@@ -468,7 +514,13 @@ class nobo:
             self._writer = None
             _LOGGER.info('connection closed')
 
-    def connect_hub(self, ip, serial):
+    def connect_hub(self, ip: str, serial: str) -> bool:
+        warnings.warn(
+            "nobo.connect_hub is deprecated and will be removed in pynobo 2.0; "
+            "use `await hub.async_connect_hub(ip, serial)` instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -476,7 +528,7 @@ class nobo:
             asyncio.set_event_loop(loop)
         return loop.run_until_complete(self.async_connect_hub(ip, serial))
 
-    async def async_connect_hub(self, ip, serial):
+    async def async_connect_hub(self, ip: str, serial: str) -> bool:
         """
         Attempt initial connection and handshake.
 
@@ -484,16 +536,22 @@ class nobo:
         :param serial: The complete 12 digit serial number of the hub to connect to
         """
         if len(serial) != 12 or not serial.isdigit():
-            raise ValueError(f'Invalid serial number: {serial}')
+            raise PynoboValidationError(f'Invalid serial number: {serial}')
 
-        self._reader, self._writer = await asyncio.wait_for(asyncio.open_connection(ip, 27779), timeout=5)
+        try:
+            self._reader, self._writer = await asyncio.wait_for(asyncio.open_connection(ip, 27779), timeout=5)
+        except (OSError, asyncio.TimeoutError) as e:
+            raise PynoboConnectionError(f'Failed to connect to Nobø Ecohub at {ip}') from e
 
         # start handshake: "HELLO <version of command set> <Hub s.no.> <date and time in format 'yyyyMMddHHmmss'>\r"
         now = datetime.datetime.now(self.timezone).strftime('%Y%m%d%H%M%S')
         await self.async_send_command([nobo.API.START, nobo.API.VERSION, serial, now])
 
         # receive the response data (4096 is recommended buffer size)
-        response = await asyncio.wait_for(self.get_response(), timeout=5)
+        try:
+            response = await asyncio.wait_for(self.get_response(), timeout=5)
+        except asyncio.TimeoutError as e:
+            raise PynoboConnectionError(f'Timed out waiting for handshake response from {ip}') from e
         _LOGGER.debug('first handshake response: %s', response)
 
         # successful response is "HELLO <its version of command set>\r"
@@ -506,7 +564,10 @@ class nobo:
 
             # send/receive handshake complete
             await self.async_send_command([nobo.API.HANDSHAKE])
-            response = await asyncio.wait_for(self.get_response(), timeout=5)
+            try:
+                response = await asyncio.wait_for(self.get_response(), timeout=5)
+            except asyncio.TimeoutError as e:
+                raise PynoboConnectionError(f'Timed out waiting for final handshake response from {ip}') from e
             _LOGGER.debug('second handshake response: %s', response)
 
             if response[0] == nobo.API.HANDSHAKE:
@@ -515,7 +576,10 @@ class nobo:
                 self.hub_serial = serial
 
                 # Get initial data
-                await asyncio.wait_for(self._get_initial_data(), timeout=5)
+                try:
+                    await asyncio.wait_for(self._get_initial_data(), timeout=5)
+                except asyncio.TimeoutError as e:
+                    raise PynoboConnectionError(f'Timed out waiting for initial data from {ip}') from e
                 for callback in self._callbacks:
                     callback(self)
                 return True
@@ -523,7 +587,7 @@ class nobo:
                 # Something went wrong...
                 _LOGGER.error('Final handshake not as expected %s', response)
                 await self.close()
-                raise Exception(f'Final handshake not as expected {response}')
+                raise PynoboHandshakeError(f'Final handshake not as expected {response}')
         if response[0] == nobo.API.REJECT:
             # This may not be the hub we are looking for
 
@@ -538,9 +602,9 @@ class nobo:
 
         # Unexpected response
         _LOGGER.error('connection to hub rejected: %s', response)
-        raise Exception(f'connection to hub rejected: {response}')
+        raise PynoboHandshakeError(f'connection to hub rejected: {response}')
 
-    async def reconnect_hub(self):
+    async def reconnect_hub(self) -> None:
         """Attempt to reconnect to the hub."""
 
         _LOGGER.info('reconnecting to hub')
@@ -565,7 +629,7 @@ class nobo:
                         discovered_hubs.add( (discover_ip, discover_serial) )
                         await asyncio.sleep(1)
                     else:
-                        raise e
+                        raise PynoboConnectionError(f'Failed to reconnect to Nobø Ecohub at {discover_ip}: {e}') from e
         else:
             connected = False
             while not connected:
@@ -578,15 +642,24 @@ class nobo:
                         if e.errno in RECONNECT_ERRORS:
                             _LOGGER.debug('Ignoring %s', e)
                         else:
-                            raise e
+                            raise PynoboConnectionError(f'Failed to reconnect to Nobø Ecohub at {self.ip}: {e}') from e
 
         self._keep_alive = True
         _LOGGER.info('reconnected to Nobø Hub')
 
     @staticmethod
-    def discover_hubs(serial="", ip=None, autodiscover_wait=3.0, loop=None):
-        if loop is not None:
-            _LOGGER.warning("loop is deprecated")
+    def discover_hubs(
+        serial: str = "",
+        ip: str | None = None,
+        autodiscover_wait: float = 3.0,
+        loop: asyncio.AbstractEventLoop | None = None,
+    ) -> set[tuple[str, str]]:
+        warnings.warn(
+            "nobo.discover_hubs is deprecated and will be removed in pynobo 2.0; "
+            "use `await nobo.async_discover_hubs(...)` instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -595,7 +668,13 @@ class nobo:
         return loop.run_until_complete(nobo.async_discover_hubs(serial, ip, autodiscover_wait))
 
     @staticmethod
-    async def async_discover_hubs(serial="", ip=None, autodiscover_wait=3.0, loop=None, rediscover=False):
+    async def async_discover_hubs(
+        serial: str = "",
+        ip: str | None = None,
+        autodiscover_wait: float = 3.0,
+        loop: asyncio.AbstractEventLoop | None = None,
+        rediscover: bool = False,
+    ) -> set[tuple[str, str]]:
         """
         Attempt to autodiscover Nobø Ecohubs on the local network.
 
@@ -623,7 +702,11 @@ class nobo:
         """
 
         if loop is not None:
-            _LOGGER.warning("loop is deprecated.")
+            warnings.warn(
+                "the loop parameter is deprecated and will be removed in pynobo 2.0.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         transport, protocol = await asyncio.get_running_loop().create_datagram_endpoint(
             lambda: nobo.DiscoveryProtocol(serial, ip),
             local_addr=('0.0.0.0', 10000),
@@ -651,7 +734,7 @@ class nobo:
                 pass
         return False
 
-    async def keep_alive(self, interval = 14):
+    async def keep_alive(self, interval: int = 14) -> None:
         """
         Send a periodic handshake. Needs to be sent every < 30 sec, preferably every 14 seconds.
 
@@ -663,7 +746,7 @@ class nobo:
             if self._keep_alive:
                 await self.async_send_command([nobo.API.HANDSHAKE])
 
-    def _create_task(self, target):
+    def _create_task(self, target: Any) -> None:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -671,10 +754,16 @@ class nobo:
             asyncio.set_event_loop(loop)
         loop.call_soon_threadsafe(lambda: loop.create_task(target))
 
-    def send_command(self, commands):
+    def send_command(self, commands: list[Any]) -> None:
+        warnings.warn(
+            "nobo.send_command is deprecated and will be removed in pynobo 2.0; "
+            "use `await hub.async_send_command(commands)` instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._create_task(self.async_send_command(commands))
 
-    async def async_send_command(self, commands):
+    async def async_send_command(self, commands: list[Any]) -> None:
         """
         Send a list of command string(s) to the hub.
 
@@ -698,13 +787,13 @@ class nobo:
             _LOGGER.info('lost connection to hub (%s)', e)
             await self.close()
 
-    async def _get_initial_data(self):
+    async def _get_initial_data(self) -> None:
         self._received_all_info = False
         await self.async_send_command([nobo.API.GET_ALL_INFO])
         while not self._received_all_info:
             self.response_handler(await self.get_response())
 
-    async def get_response(self):
+    async def get_response(self) -> list[str]:
         """
         Get a response string from the hub and reformat string list before returning it.
 
@@ -716,12 +805,12 @@ class nobo:
         except ConnectionError as e:
             _LOGGER.info('lost connection to hub (%s)', e)
             await self.close()
-            raise e
+            raise PynoboConnectionError(f'Lost connection to Nobø Ecohub: {e}') from e
         response  = message.decode('utf-8').split(' ')
         _LOGGER.debug('received: %s', response)
         return response
 
-    async def socket_receive(self):
+    async def socket_receive(self) -> None:
         try:
             while True:
                 try:
@@ -743,6 +832,7 @@ class nobo:
                         _LOGGER.info('Reconnecting due to %s', e)
                         await self.reconnect_hub()
                     else:
+                        # Caught by the outer `except Exception` below, so don't need to wrap.
                         raise e
         except asyncio.CancelledError:
             _LOGGER.debug('socket_receive stopped')
@@ -752,7 +842,7 @@ class nobo:
             # Just disconnect (instead of risking an infinite reconnect loop)
             await self.stop()
 
-    def response_handler(self, response):
+    def response_handler(self, response: list[str]) -> None:
         """
         Handle the response(s) from the hub and update the dictionaries accordingly.
 
@@ -846,10 +936,32 @@ class nobo:
             _LOGGER.warning('behavior undefined for this response: %s', response)
             warnings.warn(f'behavior undefined for this response: {response}') #overkill?
 
-    def create_override(self, mode, type, target_type, target_id='-1', end_time='-1', start_time='-1'):
+    def create_override(
+        self,
+        mode: str,
+        type: str,
+        target_type: str,
+        target_id: str = '-1',
+        end_time: str = '-1',
+        start_time: str = '-1',
+    ) -> None:
+        warnings.warn(
+            "nobo.create_override is deprecated and will be removed in pynobo 2.0; "
+            "use `await hub.async_create_override(...)` instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._create_task(self.async_create_override(mode, type, target_type, target_id, end_time, start_time))
 
-    async def async_create_override(self, mode, type, target_type, target_id='-1', end_time='-1', start_time='-1'):
+    async def async_create_override(
+        self,
+        mode: str,
+        type: str,
+        target_type: str,
+        target_id: str = '-1',
+        end_time: str = '-1',
+        start_time: str = '-1',
+    ) -> None:
         """
         Override hub/zones/components. Use OVERRIDE_MODE_NORMAL to disable an existing override.
 
@@ -861,23 +973,23 @@ class nobo:
         :param start_time: the start time (default -1), format YYYYMMDDhhmm, where mm must be in whole 15 minutes
         """
         if not mode in nobo.API.OVERRIDE_MODES:
-            raise ValueError(f'Unknown override mode {mode}')
+            raise PynoboValidationError(f'Unknown override mode {mode}')
         if not type in nobo.API.OVERRIDE_TYPES:
-            raise ValueError(f'Unknown override type {type}')
+            raise PynoboValidationError(f'Unknown override type {type}')
         if not target_type in nobo.API.OVERRIDE_TARGETS:
-            raise ValueError(f'Unknown override target type {target_type}')
+            raise PynoboValidationError(f'Unknown override target type {target_type}')
         if target_id != '-1' and not target_id in self.zones:
-            raise ValueError(f'Unknown override target {target_id}')
+            raise PynoboValidationError(f'Unknown override target {target_id}')
         if end_time != '-1':
             if not nobo.API.is_valid_datetime(end_time):
-                raise ValueError(f'Illegal end_time {end_time}: Cannot parse')
+                raise PynoboValidationError(f'Illegal end_time {end_time}: Cannot parse')
             if not nobo.API.time_is_quarter(end_time[-2:]):
-                raise ValueError(f'Illegal end_time {end_time}: Must be in whole 15 minutes')
+                raise PynoboValidationError(f'Illegal end_time {end_time}: Must be in whole 15 minutes')
         if start_time != '-1':
             if not nobo.API.is_valid_datetime(start_time):
-                raise ValueError(f'Illegal start_time: {start_time}: Cannot parse')
+                raise PynoboValidationError(f'Illegal start_time: {start_time}: Cannot parse')
             if not nobo.API.time_is_quarter(end_time[-2:]):
-                raise ValueError(f'Illegal start_time {end_time}: Must be in whole 15 minutes')
+                raise PynoboValidationError(f'Illegal start_time {end_time}: Must be in whole 15 minutes')
         command = [nobo.API.ADD_OVERRIDE, '1', mode, type, end_time, start_time, target_type, target_id]
         await self.async_send_command(command)
         for o in self.overrides: # Save override before command has finished executing
@@ -885,10 +997,32 @@ class nobo:
                 self.overrides[o]['mode'] = mode
                 self.overrides[o]['type'] = type
 
-    def update_zone(self, zone_id, name=None, week_profile_id=None, temp_comfort_c=None, temp_eco_c=None, override_allowed=None):
+    def update_zone(
+        self,
+        zone_id: str,
+        name: str | None = None,
+        week_profile_id: str | None = None,
+        temp_comfort_c: int | str | None = None,
+        temp_eco_c: int | str | None = None,
+        override_allowed: str | None = None,
+    ) -> None:
+        warnings.warn(
+            "nobo.update_zone is deprecated and will be removed in pynobo 2.0; "
+            "use `await hub.async_update_zone(...)` instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._create_task(self.async_update_zone(zone_id, name, week_profile_id, temp_comfort_c, temp_eco_c, override_allowed))
 
-    async def async_update_zone(self, zone_id, name=None, week_profile_id=None, temp_comfort_c=None, temp_eco_c=None, override_allowed=None):
+    async def async_update_zone(
+        self,
+        zone_id: str,
+        name: str | None = None,
+        week_profile_id: str | None = None,
+        temp_comfort_c: int | str | None = None,
+        temp_eco_c: int | str | None = None,
+        override_allowed: str | None = None,
+    ) -> None:
         """
         Update the name, week profile, temperature or override allowing for a zone.
 
@@ -901,7 +1035,7 @@ class nobo:
         """
 
         if not zone_id in self.zones:
-            raise ValueError(f'Unknown zone id {zone_id}')
+            raise PynoboValidationError(f'Unknown zone id {zone_id}')
 
         # Initialize command with the current zone settings
         command = [nobo.API.UPDATE_ZONE] + list(self.zones[zone_id].values())
@@ -910,11 +1044,11 @@ class nobo:
         if name:
             name = name.replace(" ", "\u00A0")
             if len(name.encode('utf-8')) > 100:
-                raise ValueError(f'Zone name "{name}" too long (max 100 bytes when encoded as UTF-8)')
+                raise PynoboValidationError(f'Zone name "{name}" too long (max 100 bytes when encoded as UTF-8)')
             command[2] = name
         if week_profile_id:
             if not week_profile_id in self.week_profiles:
-                raise ValueError(f'Unknown week profile id {week_profile_id}')
+                raise PynoboValidationError(f'Unknown week profile id {week_profile_id}')
             command[3] = week_profile_id
         if temp_comfort_c:
             nobo.API.validate_temperature(temp_comfort_c)
@@ -926,15 +1060,15 @@ class nobo:
             self.zones[zone_id]['temp_eco_c'] = temp_eco_c # Save setting before sending command
         if override_allowed:
             if override_allowed != nobo.API.OVERRIDE_NOT_ALLOWED and override_allowed != nobo.API.OVERRIDE_ALLOWED:
-                raise ValueError(f'Illegal value for override allowed: {override_allowed}')
+                raise PynoboValidationError(f'Illegal value for override allowed: {override_allowed}')
             command[6] = override_allowed
         if int(command[4]) < int(command[5]):
-            raise ValueError(f'Comfort temperature({command[4]}°C) cannot be less than eco temperature({command[5]}°C)')
+            raise PynoboValidationError(f'Comfort temperature({command[4]}°C) cannot be less than eco temperature({command[5]}°C)')
 
         await self.async_send_command(command)
 
 
-    async def async_add_week_profile(self, name, profile=None):
+    async def async_add_week_profile(self, name: str, profile: list[str] | None = None) -> None:
         """
         Add the name and profile parameter for a week.
 
@@ -953,14 +1087,19 @@ class nobo:
         converted_profile =','.join(profile)
         name = name.replace(" ", "\u00A0")
         if len(name.encode('utf-8')) > 100:
-            raise ValueError(f'Zone name "{name}" too long (max 100 bytes when encoded as UTF-8)')
+            raise PynoboValidationError(f'Zone name "{name}" too long (max 100 bytes when encoded as UTF-8)')
 
         command = [nobo.API.ADD_WEEK_PROFILE] + [week_profile_id] + [name] + [converted_profile]
 
         await self.async_send_command(command)
 
 
-    async def async_update_week_profile(self, week_profile_id: str, name=None, profile=None):
+    async def async_update_week_profile(
+        self,
+        week_profile_id: str,
+        name: str | None = None,
+        profile: list[str] | None = None,
+    ) -> None:
         """
         Update the name and profile parameter for a week.
 
@@ -970,14 +1109,14 @@ class nobo:
         """
 
         if week_profile_id not in self.week_profiles:
-            raise ValueError(f"Unknown week profile {week_profile_id}")
+            raise PynoboValidationError(f"Unknown week profile {week_profile_id}")
         if name is None and profile is None:
-            raise ValueError("Set at least name or profile to update")
+            raise PynoboValidationError("Set at least name or profile to update")
 
         if name:
             name = name.replace(" ", "\u00A0")
             if len(name.encode('utf-8')) > 100:
-                 raise ValueError(f'Zone name "{name}" too long (max 100 bytes when encoded as UTF-8)')
+                 raise PynoboValidationError(f'Zone name "{name}" too long (max 100 bytes when encoded as UTF-8)')
         else:
             name = self.week_profiles[week_profile_id]["name"]
 
@@ -989,7 +1128,7 @@ class nobo:
         command = [nobo.API.UPDATE_WEEK_PROFILE, week_profile_id, name, ','.join(profile)]
         await self.async_send_command(command)
 
-    async def async_remove_week_profile(self, week_profile_id: str):
+    async def async_remove_week_profile(self, week_profile_id: str) -> None:
         """
         Remove the week profile.
 
@@ -997,10 +1136,10 @@ class nobo:
         """
 
         if week_profile_id not in self.week_profiles:
-            raise ValueError(f"Unknown week profile {week_profile_id}")
+            raise PynoboValidationError(f"Unknown week profile {week_profile_id}")
 
         if week_profile_id in (v['week_profile_id'] for k, v in self.zones.items()):
-            raise ValueError(f"Week profile {week_profile_id} in use, can not remove")
+            raise PynoboValidationError(f"Week profile {week_profile_id} in use, can not remove")
 
         name = self.week_profiles[week_profile_id]["name"]
         profile = self.week_profiles[week_profile_id]["profile"]
@@ -1008,7 +1147,7 @@ class nobo:
         command = [nobo.API.REMOVE_WEEK_PROFILE, week_profile_id, name, ','.join(profile)]
         await self.async_send_command(command)
 
-    def get_week_profile_status(self, week_profile_id, dt: datetime.datetime=None):
+    def get_week_profile_status(self, week_profile_id: str, dt: datetime.datetime | None = None) -> str:
         """
         Get the status of a week profile at a certain time in the week. Monday is day 0.
 
@@ -1040,7 +1179,7 @@ class nobo:
         )
         return nobo.API.DICT_WEEK_PROFILE_STATUS_TO_NAME[status]
 
-    def get_zone_override_mode(self, zone_id):
+    def get_zone_override_mode(self, zone_id: str) -> str:
         """
         Get the override mode of a zone.
 
@@ -1064,7 +1203,7 @@ class nobo:
         _LOGGER.debug('Current override for zone %s is %s', self.zones[zone_id]['name'], mode)
         return mode
 
-    def get_current_zone_mode(self, zone_id, now: datetime.datetime=None):
+    def get_current_zone_mode(self, zone_id: str, now: datetime.datetime | None = None) -> str:
         """
         Get the mode of a zone at a certain time. If the zone is overridden only now is possible.
 
@@ -1087,7 +1226,7 @@ class nobo:
             current_mode)
         return current_mode
 
-    def get_current_component_temperature(self, serial):
+    def get_current_component_temperature(self, serial: str) -> str | None:
         """
         Get the current temperature from a component.
 
@@ -1107,7 +1246,7 @@ class nobo:
         return current_temperature
 
     # Function to get (first) temperature in a zone
-    def get_current_zone_temperature(self, zone_id):
+    def get_current_zone_temperature(self, zone_id: str) -> str | None:
         """
         Get the current temperature from (the first component in) a zone.
 
