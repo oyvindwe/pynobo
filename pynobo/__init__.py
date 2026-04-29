@@ -35,8 +35,13 @@ class PynoboError(Exception):
     """Base class for all pynobo errors."""
 
 
-class PynoboConnectionError(PynoboError):
-    """Raised when the TCP connection to the hub fails or is lost."""
+class PynoboConnectionError(PynoboError, OSError):
+    """Raised when the TCP connection to the hub fails or is lost.
+
+    Also inherits OSError for back-compat: existing consumers that catch
+    OSError from asyncio.open_connection (e.g. Home Assistant's nobo_hub
+    rediscovery fallback) continue to work transparently.
+    """
 
 
 class PynoboHandshakeError(PynoboError):
@@ -515,8 +520,6 @@ class nobo:
             _LOGGER.error('Could not connect to Nobø Ecohub')
             raise PynoboConnectionError(f'Failed to connect to Nobø Ecohub with serial: {self.serial} and ip: {self.ip}')
 
-        self._set_connected(True)
-
     async def start(self) -> None:
         """Discover Ecohub and start the TCP client."""
 
@@ -617,6 +620,11 @@ class nobo:
                     await asyncio.wait_for(self._get_initial_data(), timeout=5)
                 except asyncio.TimeoutError as e:
                     raise PynoboConnectionError(f'Timed out waiting for initial data from {ip}') from e
+                # Fire connection callback before data callback so consumers
+                # that gate on `connected` see the transition before the data
+                # arrives and don't have to handle a "data while disconnected"
+                # window during reconnect.
+                self._set_connected(True)
                 for callback in self._callbacks:
                     callback(self)
                 return True
@@ -684,7 +692,6 @@ class nobo:
             delay = min(delay * 2, RECONNECT_MAX_DELAY)
 
         self._keep_alive = True
-        self._set_connected(True)
         _LOGGER.info('reconnected to Nobø Hub')
 
     @staticmethod
@@ -877,8 +884,8 @@ class nobo:
                         self.response_handler(response)
                         for callback in self._callbacks:
                             callback(self)
-                except (asyncio.IncompleteReadError) as e:
-                    _LOGGER.info('Reconnecting due to %s', e)
+                except asyncio.IncompleteReadError:
+                    _LOGGER.info('connection to hub closed by peer; reconnecting')
                     self._set_connected(False)
                     await self.reconnect_hub()
                 except PynoboConnectionError as e:

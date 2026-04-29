@@ -303,6 +303,9 @@ class TestSocketReceiveReconnect(unittest.IsolatedAsyncioTestCase):
             call_count['n'] += 1
             if call_count['n'] < 3:
                 raise PynoboConnectionError("transient network failure")
+            # Mirror real async_connect_hub: fire the connection callback on
+            # success before returning, so reconnect_hub doesn't have to.
+            hub._set_connected(True)
             return True
 
         hub.async_connect_hub = fake_connect
@@ -378,6 +381,44 @@ class TestSocketReceiveReconnect(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(reconnect_calls), 1)
         self.assertEqual(events, [True, False, True])
+
+    async def test_connect_fires_connection_callback_before_data_callback(self):
+        """async_connect_hub fires the connection callback before the data callback.
+
+        Consumers (notably HA's nobo_hub integration) gate availability on the
+        connection callback. Reordering them would re-introduce the race where
+        a data callback fires while the consumer still thinks the hub is
+        disconnected.
+        """
+        hub = nobo('123456789012', ip='192.168.1.1', discover=False, synchronous=False)
+        order = []
+        hub.register_callback(lambda _h: order.append('data'))
+        hub.register_connection_callback(lambda _h, _s: order.append('connection'))
+
+        reader = MagicMock(spec=asyncio.StreamReader)
+        writer = MagicMock(spec=asyncio.StreamWriter)
+        writer.close = MagicMock()
+        writer.wait_closed = AsyncMock()
+
+        # Successful handshake responses, then nothing (handshake-only path).
+        responses = iter([
+            ['HELLO', nobo.API.VERSION, '123456789012', '20260101000000'],
+            ['HANDSHAKE'],
+        ])
+
+        async def fake_get_response():
+            return next(responses)
+
+        hub.get_response = fake_get_response
+        hub.async_send_command = AsyncMock()
+        hub._get_initial_data = AsyncMock()
+
+        with patch('pynobo.asyncio.open_connection',
+                   new=AsyncMock(return_value=(reader, writer))):
+            result = await hub.async_connect_hub('192.168.1.1', '123456789012')
+
+        self.assertTrue(result)
+        self.assertEqual(order, ['connection', 'data'])
 
 
 if __name__ == '__main__':
