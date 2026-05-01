@@ -698,7 +698,7 @@ class nobo:
     def discover_hubs(
         serial: str = "",
         ip: str | None = None,
-        autodiscover_wait: float = 3.0,
+        autodiscover_wait: float = 5.0,
         loop: asyncio.AbstractEventLoop | None = None,
     ) -> set[tuple[str, str]]:
         warnings.warn(
@@ -718,7 +718,7 @@ class nobo:
     async def async_discover_hubs(
         serial: str = "",
         ip: str | None = None,
-        autodiscover_wait: float = 3.0,
+        autodiscover_wait: float = 5.0,
         loop: asyncio.AbstractEventLoop | None = None,
         rediscover: bool = False,
     ) -> set[tuple[str, str]]:
@@ -741,7 +741,7 @@ class nobo:
 
         :param serial: The last 3 digits of the Ecohub serial number or the complete 12 digit serial number
         :param ip: ip address to search for Ecohub at (default None)
-        :param autodiscover_wait: how long to wait for an autodiscover package from the hub (default 3.0)
+        :param autodiscover_wait: how long to wait for an autodiscover package from the hub (default 5.0)
         :param loop: deprecated
         :param rediscover: if true, run until the hub is discovered
 
