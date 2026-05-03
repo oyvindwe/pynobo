@@ -104,6 +104,59 @@ not perform any I/O, and can safely be called from the event loop.
 * get_current_zone_temperature - Get the current temperature from (the first component in) a zone
 * get_zone_override_mode - Get the override mode for the zone
 
+### Connection state
+
+Consumers can observe when the hub connects, disconnects, or reconnects. The
+`connected` property reflects the current state; register a callback to be
+notified on every transition. Callbacks MUST be safe to call from the event
+loop; exceptions they raise are logged and swallowed.
+
+    # Called with (hub, True) on connect/reconnect, (hub, False) on disconnect
+    def on_connection_state(hub, connected):
+        print("connected" if connected else "disconnected")
+
+    hub.register_connection_callback(on_connection_state)
+    await hub.connect()
+    assert hub.connected
+    # ...later, to stop listening:
+    hub.deregister_connection_callback(on_connection_state)
+
+### Reconnect behavior
+
+If the connection is lost, pynobo reconnects automatically. Consumers observe
+transitions through the connection callback above (`True → False → True`); there
+is no need to call `connect()` or `start()` again.
+
+**What triggers a reconnect:**
+
+* TCP errors on the receive socket (e.g. `ECONNRESET` after ~24 h, network
+  interface going away).
+* Silent network drops — if no frame has arrived from the hub within 2× the
+  keep-alive interval (~28 s by default), the connection is forced closed and
+  the reconnect path runs. This covers cases where outgoing packets are
+  dropped without any error surfacing (WiFi disabled, switch unplugged, hub
+  unreachable).
+
+**Retry schedule:** exponential backoff from 10 s up to 60 s, retrying
+indefinitely while the failure is transport-level. The hub will reconnect as
+soon as the network returns, regardless of outage length.
+
+**Terminal failures:** if the hub rejects the handshake (wrong serial,
+unsupported API version) during reconnect, pynobo logs the error and stops
+the background tasks. The connection state stays `False` (set when the drop
+was first detected) and is not recovered automatically — the consumer must
+fix the configuration and call `connect()` / `start()` again.
+
+**Log signals worth watching:**
+
+* `lost connection to hub (...)` — a TCP error occurred; reconnect is starting.
+* `no response from hub in 28s, forcing reconnect` — the liveness check
+  tripped (silent drop detected).
+* `reconnect attempt failed: ...; retrying in Ns` — an individual attempt
+  failed; backoff continues.
+* `reconnected to Nobø Hub` — back online.
+* `hub rejected handshake, giving up: ...` — terminal; intervention required.
+
 ## Exceptions
 
 Errors raised by pynobo inherit from `PynoboError`:
